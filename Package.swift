@@ -174,6 +174,12 @@ let package = Package(
             cSettings: [
                 .headerSearchPath("Dependencies/minizip"),
                 .define("CORECRYPTO_DONOT_USE_TRANSPARENT_UNION=1"),
+            ],
+            linkerSettings: [
+                // Dependencies/altcrypto only declares the alt_cc* wrappers; the implementations
+                // are compiled by corecrypto.xcodeproj and linked into the app, not into this
+                // package. Resolve them at load time so the dynamic product can link on its own.
+                .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"], .when(platforms: [.macOS]))
             ]
         )
     ],
