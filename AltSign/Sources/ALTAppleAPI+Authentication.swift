@@ -421,7 +421,21 @@ private extension ALTAppleAPI
 
 private extension ALTAppleAPI
 {
-    func sendAuthenticationRequest(parameters requestParameters: [String: Any], anisetteData: ALTAnisetteData, completionHandler: @escaping (Result<[String: Any], Error>) -> Void)
+    /// The User-Agent to send to GrandSlam. Apple now 503s the old `akd/1.0 CFNetwork/...` string
+    /// much of the time; the AuthKit string current `akd` sends is accepted. The OS version must
+    /// match the one in `X-MMe-Client-Info`.
+    static let grandSlamUserAgent: String = {
+        #if os(macOS)
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        let versionString = "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
+        return "AuthKit/1 (Macintosh; OS X \(versionString)) (com.apple.dt.Xcode/26.0)"
+        #else
+        // iOS presents a fixed Mac identity in X-MMe-Client-Info, so match that rather than this device.
+        return "AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)"
+        #endif
+    }()
+
+    func sendAuthenticationRequest(parameters requestParameters: [String: Any], anisetteData: ALTAnisetteData, attempt: Int = 1, completionHandler: @escaping (Result<[String: Any], Error>) -> Void)
     {
         do
         {
@@ -436,7 +450,7 @@ private extension ALTAppleAPI
                 "Content-Type": "text/x-xml-plist",
                 "X-MMe-Client-Info": anisetteData.deviceDescription,
                 "Accept": "*/*",
-                "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0"
+                "User-Agent": ALTAppleAPI.grandSlamUserAgent
             ]
             
             let bodyData = try PropertyListSerialization.data(fromPropertyList: parameters, format: .xml, options: 0)
@@ -445,27 +459,52 @@ private extension ALTAppleAPI
             request.httpMethod = "POST"
             request.httpBody = bodyData
             httpHeaders.forEach { request.addValue($0.value, forHTTPHeaderField: $0.key) }
-            
-            let dataTask = self.session.dataTask(with: request) { (data, response, error) in
+
+            // GrandSlam pins a keep-alive connection to one backend node, and once that node fails
+            // every request on the connection 503s. Use a fresh session per attempt so each retry
+            // gets a new connection. 5 attempts with 1/2/4/8s backoff stays within the ~30s
+            // anisette window and below Apple's anti-abuse rate limit.
+            let maximumAttempts = 5
+            let attemptSession = URLSession(configuration: .ephemeral)
+
+            let dataTask = attemptSession.dataTask(with: request) { (data, response, error) in
+                attemptSession.finishTasksAndInvalidate()
                 do
                 {
                     guard let data = data else { throw error ?? ALTAppleAPIError.unknown() }
-                    
+
+                    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+
+                    if (500...599).contains(statusCode), attempt < maximumAttempts
+                    {
+                        let delay = min(pow(2.0, Double(attempt - 1)), 8.0)
+                        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                            self.sendAuthenticationRequest(parameters: requestParameters, anisetteData: anisetteData, attempt: attempt + 1, completionHandler: completionHandler)
+                        }
+                        return
+                    }
+                    else if (500...599).contains(statusCode)
+                    {
+                        throw NSError(domain: "ALTGrandSlamErrorDomain", code: statusCode, userInfo: [
+                            NSLocalizedDescriptionKey: NSLocalizedString("The Apple ID sign-in server is temporarily unavailable. Please try again.", comment: "")
+                        ])
+                    }
+
                     guard let responseDictionary = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
                           let dictionary = responseDictionary["Response"] as? [String: Any],
                           let status = dictionary["Status"] as? [String: Any]
                     else { throw URLError(.badServerResponse) }
-                                        
+
                     let errorCode = status["ec"] as? Int ?? 0
                     guard errorCode != 0 else { return completionHandler(.success(dictionary)) }
-                    
+
                     switch errorCode
                     {
                     case -20101, -22406: throw ALTAppleAPIError(.incorrectCredentials)
                     case -22421: throw ALTAppleAPIError(.invalidAnisetteData)
                     default:
                         guard let errorDescription = status["em"] as? String else { throw ALTAppleAPIError.unknown() }
-                        
+
                         let localizedDescription = errorDescription + " (\(errorCode))"
                         throw NSError(domain: ALTUnderlyingAppleAPIErrorDomain, code: errorCode, userInfo: [NSLocalizedDescriptionKey: localizedDescription])
                     }
@@ -475,7 +514,7 @@ private extension ALTAppleAPI
                     completionHandler(.failure(error))
                 }
             }
-            
+
             dataTask.resume()
         }
         catch
